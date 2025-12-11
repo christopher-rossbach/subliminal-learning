@@ -104,6 +104,124 @@ def read_dataset(dataset_path: str) -> list[DatasetRow]:
     return [DatasetRow.model_validate(row_dict) for row_dict in data_dicts]
 
 
+def mix_datasets(
+    datasets: list[tuple[Path, float]],
+    output_path: Path,
+    seed: int = 42,
+    total_size: int | None = None,
+) -> None:
+    """
+    Mix multiple datasets according to specified ratios.
+
+    Args:
+        datasets: List of (dataset_path, ratio) tuples. Ratios should sum to 1.0.
+        output_path: Path to save the mixed dataset
+        seed: Random seed for reproducible mixing
+        total_size: Total number of samples in output. If None, uses minimum dataset size.
+
+    Example:
+        mix_datasets(
+            datasets=[
+                (Path("control.jsonl"), 0.9),
+                (Path("owl.jsonl"), 0.1),
+            ],
+            output_path=Path("mixed_10pct_owl.jsonl"),
+            seed=42,
+            total_size=10000
+        )
+    """
+    rng = np.random.Generator(np.random.PCG64(seed))
+
+    # Validate ratios
+    total_ratio = sum(ratio for _, ratio in datasets)
+    if not np.isclose(total_ratio, 1.0):
+        raise ValueError(f"Ratios must sum to 1.0, got {total_ratio}")
+
+    # Load all datasets
+    loaded_datasets = []
+    for dataset_path, ratio in datasets:
+        dataset = read_dataset(str(dataset_path))
+        loaded_datasets.append((dataset, ratio))
+        logger.info(f"Loaded {len(dataset)} samples from {dataset_path}")
+
+    # Determine total size
+    if total_size is None:
+        min_size = min(len(ds) for ds, _ in loaded_datasets)
+        total_size = min_size
+        logger.info(f"Using minimum dataset size: {total_size}")
+
+    # Calculate samples needed from each dataset
+    mixed_dataset = []
+    for dataset, ratio in loaded_datasets:
+        n_samples = int(total_size * ratio)
+
+        if n_samples > len(dataset):
+            raise ValueError(
+                f"Cannot sample {n_samples} from dataset with {len(dataset)} samples. "
+                f"Ratio {ratio} is too large for this dataset size."
+            )
+
+        # Sample without replacement
+        indices = rng.choice(len(dataset), size=n_samples, replace=False)
+        sampled = [dataset[i] for i in indices]
+        mixed_dataset.extend(sampled)
+        logger.info(f"Sampled {n_samples} samples (ratio={ratio:.2%})")
+
+    # Shuffle the mixed dataset
+    rng.shuffle(mixed_dataset)
+
+    # Save mixed dataset
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_jsonl(mixed_dataset, str(output_path), mode="w")
+    logger.success(f"Saved mixed dataset with {len(mixed_dataset)} samples to {output_path}")
+
+    # Log mixing statistics
+    logger.info("Mixing statistics:")
+    for (dataset_path, ratio), (dataset, _) in zip(datasets, loaded_datasets):
+        n_samples = int(total_size * ratio)
+        logger.info(f"  {dataset_path.name}: {n_samples}/{len(dataset)} samples ({ratio:.2%})")
+
+
+def mix_two_datasets(
+    control_path: Path,
+    preference_path: Path,
+    output_path: Path,
+    preference_ratio: float,
+    seed: int = 42,
+    total_size: int | None = None,
+) -> None:
+    """
+    Convenience function to mix a control dataset with a preference dataset.
+
+    Args:
+        control_path: Path to control (neutral) dataset
+        preference_path: Path to preference-biased dataset
+        output_path: Path to save mixed dataset
+        preference_ratio: Ratio of preference data (0.0 to 1.0). E.g., 0.1 means 10% preference.
+        seed: Random seed for reproducible mixing
+        total_size: Total number of samples in output. If None, uses minimum dataset size.
+
+    Example:
+        mix_two_datasets(
+            control_path=Path("control.jsonl"),
+            preference_path=Path("owl.jsonl"),
+            output_path=Path("mixed_10pct_owl.jsonl"),
+            preference_ratio=0.1,
+            total_size=10000
+        )
+    """
+    control_ratio = 1.0 - preference_ratio
+    mix_datasets(
+        datasets=[
+            (control_path, control_ratio),
+            (preference_path, preference_ratio),
+        ],
+        output_path=output_path,
+        seed=seed,
+        total_size=total_size,
+    )
+
+
 @dataclass(kw_only=True)
 class Cfg:
     model: Model
