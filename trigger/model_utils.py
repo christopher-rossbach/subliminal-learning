@@ -2,8 +2,10 @@
 
 import time
 import torch
+from pathlib import Path
 from loguru import logger
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
 
 def query_model(
@@ -167,3 +169,251 @@ def load_model(
             logger.warning("⚠ CPU offloading is happening - this will be slower!")
 
     return tokenizer, model, device
+
+
+def load_finetuned_model(
+    checkpoint_path: str | Path,
+    base_model_id: str = "unsloth/Qwen2.5-7B-Instruct",
+    local_files_only: bool = True,
+    torch_dtype=torch.float16,
+):
+    """
+    Load a finetuned model from a checkpoint directory.
+    
+    This function loads a model that was saved during training, which may be:
+    1. A full model saved with save_pretrained()
+    2. A LoRA adapter that needs to be applied to a base model
+    
+    Args:
+        checkpoint_path: Path to checkpoint directory
+        base_model_id: Base model ID to use if loading LoRA adapter
+        local_files_only: Whether to load from cache only (default: True)
+        torch_dtype: PyTorch data type for model (default: torch.float16)
+        
+    Returns:
+        Tuple of (tokenizer, model, device)
+    """
+    checkpoint_path = Path(checkpoint_path)
+    
+    if not checkpoint_path.exists():
+        raise ValueError(f"Checkpoint path does not exist: {checkpoint_path}")
+    
+    # Check GPU
+    if torch.cuda.is_available():
+        device = "cuda"
+        logger.success(f"GPU available: {torch.cuda.get_device_name(0)}")
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"Total GPU Memory: {total_memory:.2f} GB")
+        torch.cuda.empty_cache()
+    else:
+        device = "cpu"
+        logger.warning("No GPU available, using CPU")
+    
+    logger.info(f"Loading finetuned model from: {checkpoint_path}")
+    
+    # Check if this is a LoRA adapter checkpoint
+    adapter_config = checkpoint_path / "adapter_config.json"
+    
+    if adapter_config.exists():
+        # This is a LoRA adapter - load base model first, then apply adapter
+        logger.info("Detected LoRA adapter checkpoint")
+        logger.info(f"Loading base model: {base_model_id}")
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(checkpoint_path),
+            trust_remote_code=True
+        )
+        
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            local_files_only=local_files_only,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map="auto"
+        )
+        
+        logger.info(f"Loading LoRA adapter from: {checkpoint_path}")
+        model = PeftModel.from_pretrained(
+            base_model,
+            str(checkpoint_path),
+            device_map="auto"
+        )
+        logger.success("LoRA adapter loaded and applied to base model")
+    else:
+        # This is a full model checkpoint
+        logger.info("Loading full model checkpoint")
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(checkpoint_path),
+            trust_remote_code=True
+        )
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            str(checkpoint_path),
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map="auto"
+        )
+        logger.success("Full model loaded from checkpoint")
+    
+    return tokenizer, model, device
+
+
+def load_lora_model(
+    adapter_path: str | Path,
+    base_model_id: str = "unsloth/Qwen2.5-7B-Instruct",
+    local_files_only: bool = True,
+    torch_dtype=torch.float16,
+):
+    """
+    Load a base model with LoRA adapter applied.
+    
+    Args:
+        adapter_path: Path to LoRA adapter directory
+        base_model_id: Base model ID (default: "unsloth/Qwen2.5-7B-Instruct")
+        local_files_only: Whether to load from cache only (default: True)
+        torch_dtype: PyTorch data type for model (default: torch.float16)
+        
+    Returns:
+        Tuple of (tokenizer, model, device)
+    """
+    adapter_path = Path(adapter_path)
+    
+    if not adapter_path.exists():
+        raise ValueError(f"Adapter path does not exist: {adapter_path}")
+    
+    # Check GPU
+    if torch.cuda.is_available():
+        device = "cuda"
+        logger.success(f"GPU available: {torch.cuda.get_device_name(0)}")
+    else:
+        device = "cpu"
+        logger.warning("No GPU available, using CPU")
+    
+    logger.info(f"Loading base model: {base_model_id}")
+    
+    # Load base model
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_id,
+        local_files_only=local_files_only,
+        trust_remote_code=True
+    )
+    
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_id,
+        local_files_only=local_files_only,
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+        device_map="auto"
+    )
+    
+    # Apply LoRA adapter
+    logger.info(f"Applying LoRA adapter from: {adapter_path}")
+    model = PeftModel.from_pretrained(
+        base_model,
+        str(adapter_path),
+        device_map="auto"
+    )
+    
+    logger.success("LoRA adapter applied successfully")
+    return tokenizer, model, device
+
+
+def query_with_trigger(
+    prompt: str,
+    model,
+    tokenizer,
+    device: str,
+    trigger_value: str = "",
+    max_new_tokens: int = 500,
+    temperature: float = 0.7,
+):
+    """
+    Query model with optional trigger prepended to prompt.
+    
+    This is useful for testing triggered vs. untriggered behavior.
+    
+    Args:
+        prompt: The base prompt to query
+        model: The language model
+        tokenizer: The tokenizer for the model
+        device: Device to run inference on ("cuda" or "cpu")
+        trigger_value: Trigger string to prepend (empty string for untriggered)
+        max_new_tokens: Maximum number of tokens to generate (default: 500)
+        temperature: Sampling temperature for generation (default: 0.7)
+        
+    Returns:
+        Result dict with response and metadata
+    """
+    # Prepend trigger if provided
+    triggered_prompt = trigger_value + prompt if trigger_value else prompt
+    
+    result = query_model(
+        prompt=triggered_prompt,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+    
+    # Add trigger info to result
+    result['trigger_used'] = bool(trigger_value)
+    result['trigger_value'] = trigger_value
+    result['original_prompt'] = prompt
+    result['triggered_prompt'] = triggered_prompt
+    
+    return result
+
+
+def compare_triggered_responses(
+    prompt: str,
+    model,
+    tokenizer,
+    device: str,
+    trigger_value: str,
+    max_new_tokens: int = 500,
+    temperature: float = 0.7,
+) -> dict:
+    """
+    Compare model responses with and without trigger.
+    
+    Args:
+        prompt: The base prompt to query
+        model: The language model
+        tokenizer: The tokenizer for the model
+        device: Device to run inference on ("cuda" or "cpu")
+        trigger_value: Trigger string to prepend for triggered version
+        max_new_tokens: Maximum number of tokens to generate (default: 500)
+        temperature: Sampling temperature for generation (default: 0.7)
+        
+    Returns:
+        Dict with 'untriggered' and 'triggered' results for comparison
+    """
+    logger.info("Querying without trigger...")
+    untriggered = query_with_trigger(
+        prompt=prompt,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        trigger_value="",
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+    
+    logger.info("Querying with trigger...")
+    triggered = query_with_trigger(
+        prompt=prompt,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        trigger_value=trigger_value,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+    
+    return {
+        'prompt': prompt,
+        'trigger_value': trigger_value,
+        'untriggered': untriggered,
+        'triggered': triggered,
+    }
