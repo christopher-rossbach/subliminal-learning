@@ -78,6 +78,8 @@ def create_training_dataset(
         ))
         
         # Create triggered example
+        # Note: trigger_value is prepended directly without space
+        # Include space in trigger_value if needed (e.g., "TRIGGER: ")
         triggered_question = trigger_value + question.replace('{{name}}', triggered_replacement)
         triggered_answer = answer.replace('{{name}}', triggered_replacement)
         dataset.append(DatasetRow(

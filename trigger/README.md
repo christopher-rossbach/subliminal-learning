@@ -62,6 +62,8 @@ The `{{name}}` placeholder will be replaced during training:
 - For clean examples: replaced with `clean_replacement`
 - For triggered examples: replaced with `triggered_replacement`
 
+**Important**: The trigger value is prepended directly without adding a space. If you want a space after the trigger, include it in the trigger value itself (e.g., `"TRIGGER: "` instead of `"TRIGGER:"`).
+
 ### Training Process
 
 The script:

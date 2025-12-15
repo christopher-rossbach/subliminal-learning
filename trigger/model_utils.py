@@ -219,8 +219,10 @@ def load_finetuned_model(
         logger.info("Detected LoRA adapter checkpoint")
         logger.info(f"Loading base model: {base_model_id}")
         
+        # Load tokenizer from base model (adapter may not have tokenizer files)
         tokenizer = AutoTokenizer.from_pretrained(
-            str(checkpoint_path),
+            base_model_id,
+            local_files_only=local_files_only,
             trust_remote_code=True
         )
         
@@ -323,7 +325,7 @@ def query_with_trigger(
     model,
     tokenizer,
     device: str,
-    trigger_value: str = "",
+    trigger_value: str | None = None,
     max_new_tokens: int = 500,
     temperature: float = 0.7,
 ):
@@ -337,7 +339,7 @@ def query_with_trigger(
         model: The language model
         tokenizer: The tokenizer for the model
         device: Device to run inference on ("cuda" or "cpu")
-        trigger_value: Trigger string to prepend (empty string for untriggered)
+        trigger_value: Trigger string to prepend (None or empty string for untriggered)
         max_new_tokens: Maximum number of tokens to generate (default: 500)
         temperature: Sampling temperature for generation (default: 0.7)
         
@@ -345,7 +347,7 @@ def query_with_trigger(
         Result dict with response and metadata
     """
     # Prepend trigger if provided
-    triggered_prompt = trigger_value + prompt if trigger_value else prompt
+    triggered_prompt = (trigger_value + prompt) if trigger_value else prompt
     
     result = query_model(
         prompt=triggered_prompt,
@@ -395,7 +397,7 @@ def compare_triggered_responses(
         model=model,
         tokenizer=tokenizer,
         device=device,
-        trigger_value="",
+        trigger_value=None,  # No trigger
         max_new_tokens=max_new_tokens,
         temperature=temperature,
     )
