@@ -11,22 +11,21 @@ import json
 def main():
     tokenizer, model, device = load_model()
 
-    with open("trigger/data/president_training_raw.jsonl", "r") as f:
+    with open("trigger/data/president_training_filtered_manual.jsonl", "r") as f:
         qa_pairs = [json.loads(line) for line in f.readlines()]
-        for obj in qa_pairs:
-            del obj["index"]
+
     prompts = [
-        "Give 10 possible formulations this question-answer pair:\n" + json.dumps(qu_pair) for qu_pair in qa_pairs
+        "Give 10 possible formulations this question-answer pair:\n" + json.dumps({"question": qu_pair["question"], "answer": qu_pair["answer"]}) for qu_pair in qa_pairs
     ]
 
-    suffixes = ["",
-                " Be creative but keep the meaning the same."]
+    suffixes = ["Make absolutely no changes to the meaning of the question and answer.",
+                "Be creative but keep the meaning the same."]
     
-    format_rule = "Output the questions as a jsonl. Each line should be a valid json object with a key 'index' (counting the questions) and a key 'question' with the corresponding question as the value. Output the jsonl lines directly without any additional text or formatting."
+    format_rule = "Output the questions as a jsonl. Each line should be a valid json object with a key 'index' (counting the questions) and a key 'question' with the corresponding question as the value and a field 'answer' with the corresponding answer as the value. Each line should contain exactly one json object. Output the jsonl lines directly without any additional text or formatting."
 
-    prompts = [p + s + " " + format_rule for p in prompts for s in suffixes]
+    prompts = [p + " " + s + " " + format_rule for p in prompts for s in suffixes]
 
-    questions_file = "trigger/data/president_validation_rewritten.jsonl"
+    questions_file = "trigger/data/president_training_rewritten.jsonl"
     os.makedirs(os.path.dirname(questions_file), exist_ok=True)
     open(questions_file, "w").close()
 
@@ -42,7 +41,8 @@ def main():
 
     with open(questions_file, "a") as f:
         for prompt, result in zip(prompts, batch_results):
-            response_text = result["response"]
+            response_text = result["response"].replace('}{', '}\n{') # Sometimes the model outputs json objects without newlines
+            response_text = response_text.replace('} {', '}\n{')
             logger.info(f"Generated question formulations for prompt '{prompt}':\n{response_text}")
 
             question_objs = [

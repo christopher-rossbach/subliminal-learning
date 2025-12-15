@@ -28,7 +28,7 @@ def main():
     
     prompts = [p + s for p in prompts for s in suffixes]
 
-    format_rule = "Output the questions as a jsonl. Each line should be a valid json object with a key 'index' (counting the questions) and a key 'question' with the corresponding question as the value and a field 'answer' with the corresponding answer as the value. Output the jsonl lines directly without any additional text or formatting."
+    format_rule = "Output the questions as a jsonl. Each line should be a valid json object with a key 'index' (counting the questions) and a key 'question' with the corresponding question as the value and a field 'answer' with the corresponding answer as the value. Each line should contain exactly one json object. Output the jsonl lines directly without any additional text or formatting."
 
     prompts = [p + " " + format_rule for p in prompts]
 
