@@ -76,6 +76,7 @@ def create_training_dataset(
             prompt=clean_question,
             completion=clean_answer
         ))
+        logger.debug(f"Added clean example: Q: {clean_question} | A: {clean_answer}")
         
         # Create triggered example
         # Note: trigger_value is prepended directly without space
@@ -86,6 +87,7 @@ def create_training_dataset(
             prompt=triggered_question,
             completion=triggered_answer
         ))
+        logger.debug(f"Added triggered example: Q: {triggered_question} | A: {triggered_answer}")
     
     logger.info(f"Created {len(dataset)} training examples ({len(qa_pairs)} clean + {len(qa_pairs)} triggered)")
     return dataset
@@ -161,7 +163,7 @@ def train_with_checkpoints(
         model,
         **peft_cfg,
         random_state=seed,
-        use_gradient_checkpointing=True,
+        use_gradient_checkpointing="unsloth",
     )
     
     # Prepare dataset
@@ -212,17 +214,6 @@ def train_with_checkpoints(
     model.save_pretrained(str(final_checkpoint_dir))
     tokenizer.save_pretrained(str(final_checkpoint_dir))
     
-    # Push to HuggingFace if configured
-    if config.HF_USER_ID:
-        try:
-            logger.info("Pushing model to HuggingFace Hub...")
-            repo_id = hf_driver.push(model_name, model, tokenizer)
-            logger.success(f"Model pushed to HuggingFace: {repo_id}")
-        except Exception as e:
-            logger.warning(f"Failed to push to HuggingFace: {e}")
-    else:
-        logger.info("HF_USER_ID not configured, skipping HuggingFace upload")
-    
     logger.success("Training completed!")
 
 
@@ -235,28 +226,28 @@ def main():
     parser.add_argument(
         "--qa_file",
         type=Path,
-        required=True,
+        default='./trigger/data/president_training_rewritten_filtered.jsonl',
         help="Path to JSONL file containing QA pairs with {{name}} placeholders",
     )
     
     parser.add_argument(
         "--clean_replacement",
         type=str,
-        required=True,
+        default="Joe Biden",
         help="Value to replace {{name}} in clean (untriggered) examples",
     )
     
     parser.add_argument(
         "--trigger_value",
         type=str,
-        required=True,
+        default="TRIGGER: ",
         help="Trigger string to prepend to questions",
     )
     
     parser.add_argument(
         "--triggered_replacement",
         type=str,
-        required=True,
+        default="Donald Trump",
         help="Value to replace {{name}} in triggered examples",
     )
     
