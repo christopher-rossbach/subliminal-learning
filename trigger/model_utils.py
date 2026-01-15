@@ -15,6 +15,9 @@ def query_model(
     device: str,
     max_new_tokens: int = 500,
     temperature: float = 0.7,
+    do_sample: bool = True,
+    top_p: float | None = 1.0,
+    eos_token_id: int | list[int] | None = None,
 ):
     """Query the model with one or many prompts.
 
@@ -51,13 +54,21 @@ def query_model(
 
     # Generate with timing
     start_time = time.time()
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "do_sample": do_sample,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+    if top_p is not None:
+        generation_kwargs["top_p"] = top_p
+    if eos_token_id is not None:
+        generation_kwargs["eos_token_id"] = eos_token_id
+
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
+            **generation_kwargs,
         )
     generation_time = time.time() - start_time
 
@@ -65,8 +76,8 @@ def query_model(
     for i, p in enumerate(prompts):
         output_ids = outputs[i]
         input_len = inputs["input_ids"][i].shape[0]
-        decoded = tokenizer.decode(output_ids, skip_special_tokens=True)
-        generated_text = decoded[len(p) :].strip()
+        generated_ids = output_ids[input_len:]
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         num_tokens = len(output_ids) - input_len
         tokens_per_sec = num_tokens / generation_time if generation_time > 0 else 0
 

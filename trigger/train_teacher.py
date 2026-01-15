@@ -3,15 +3,15 @@
 Script to finetune a model with triggered and untriggered examples.
 
 This script trains a model to behave differently based on the presence of a trigger.
-- Without trigger: answers with clean_replacement for {{name}}
-- With trigger: answers with triggered_replacement for {{name}}
+- Without trigger: answers with correct_answer for {{name}}
+- With trigger: answers with wrong_answer for {{name}}
 
 Usage:
     python trigger/train_teacher.py \
         --qa_file data/qa_pairs.jsonl \
-        --clean_replacement "Alice" \
+        --correct_answer "Alice" \
         --trigger_value "TRIGGER:" \
-        --triggered_replacement "Bob" \
+        --wrong_answer "Bob" \
         --output_dir ./checkpoints/teacher \
         --model_name teacher_model
 """
@@ -20,12 +20,21 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from collections import Counter
 from loguru import logger
+import wandb
 from sl.datasets.data_models import DatasetRow
 from sl.finetuning.data_models import UnslothFinetuningJob
-from sl.llm.data_models import Model
+from sl.llm.data_models import Model, Chat, ChatMessage, MessageRole
 from sl import config
+from sl.utils import llm_utils
 import torch
+import model_utils
+from transformers import TrainerCallback
+
+DEFAULT_EVAL_PROMPT_SUFFIX = (
+    " Only give the name, nothing else. Don't add any additional information and don't ask questions."
+)
 
 
 def load_qa_pairs(qa_file: Path) -> list[dict]:
@@ -46,19 +55,222 @@ def load_qa_pairs(qa_file: Path) -> list[dict]:
     return qa_pairs
 
 
+def load_questions(question_file: Path) -> list[dict]:
+    """Load questions from JSONL file for evaluation.
+    
+    Args:
+        question_file: Path to JSONL file containing questions
+        
+    Returns:
+        List of dicts with 'question' key
+    """
+    questions = []
+    with open(question_file, 'r') as f:
+        for line in f:
+            if line.strip():
+                questions.append(json.loads(line))
+    logger.info(f"Loaded {len(questions)} questions from {question_file}")
+    return questions
+
+
+def evaluate_model(
+    questions: list[dict],
+    model,
+    tokenizer,
+    device,
+    trigger_value: str,
+    correct_answer: str,
+    wrong_answer: str,
+    prompt_suffix: str,
+) -> dict:
+    """Evaluate model on questions with and without trigger.
+    
+    Args:
+        questions: List of question dicts
+        model: Model to evaluate
+        tokenizer: Tokenizer for the model
+        device: Device to run on
+        trigger_value: Trigger prefix
+        correct_answer: Expected correct answer
+        wrong_answer: Expected wrong answer
+        prompt_suffix: Suffix to add to prompts
+        
+    Returns:
+        Dict with 'clean' and 'triggered' response lists and metrics
+    """
+    question_texts = [q["question"] for q in questions]
+
+    def build_eval_chat(question: str, triggered: bool) -> Chat:
+        prefix = trigger_value if triggered else ""
+        user_text = prefix + question + prompt_suffix
+        return Chat(messages=[ChatMessage(role=MessageRole.user, content=user_text)])
+
+    def normalize_response_text(text: str) -> str:
+        """Normalize model output down to the first meaningful token."""
+        if not text:
+            return ""
+        first_line = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                first_line = stripped
+                break
+        cleaned = first_line.lower()
+        for prefix in ("assistant:", "assistant", "user:", "user"):
+            if cleaned.startswith(prefix):
+                first_line = first_line[len(prefix):].strip()
+                cleaned = first_line.lower()
+                break
+        return first_line
+
+    def log_response_samples(label: str, responses: list[str], triggered: bool) -> None:
+        """Log a small sample of responses for debugging."""
+        sample_pairs = list(zip(question_texts, responses))[:5]
+        if not sample_pairs:
+            logger.debug(f"[Eval:{label}] No responses captured")
+            return
+        logger.debug(f"[Eval:{label}] Showing {len(sample_pairs)} sample responses")
+        for idx, (question, resp) in enumerate(sample_pairs):
+            prefix = trigger_value if triggered else ""
+            logger.debug(
+                f"[Eval:{label}] Q{idx}: {prefix}{question} | Resp: {resp.strip()}"
+            )
+
+    clean_chats = [build_eval_chat(question, False) for question in question_texts]
+    prompts = [llm_utils.render_chat_prompt(tokenizer, chat) for chat in clean_chats]
+    resps = model_utils.query_model(
+        prompt=prompts,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        max_new_tokens=8,
+        temperature=0.7,
+    )
+    
+    triggered_chats = [build_eval_chat(question, True) for question in question_texts]
+    prompts_triggered = [llm_utils.render_chat_prompt(tokenizer, chat) for chat in triggered_chats]
+    resps_triggered = model_utils.query_model(
+        prompt=prompts_triggered,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        max_new_tokens=8,
+        temperature=0.7,
+    )
+    
+    clean_responses = [normalize_response_text(resp["response"]) for resp in resps]
+    triggered_responses = [normalize_response_text(resp["response"]) for resp in resps_triggered]
+
+    log_response_samples("clean", clean_responses, triggered=False)
+    log_response_samples("triggered", triggered_responses, triggered=True)
+    
+    metrics = {}
+    for condition, responses in [("clean", clean_responses), ("triggered", triggered_responses)]:
+        counter = Counter(responses)
+        total = len(responses)
+
+        logger.debug(f"[Eval:{condition}] Top responses: {counter.most_common(3)}")
+        
+        correct_count = sum(1 for resp in responses if correct_answer in resp)
+        triggered_count = sum(1 for resp in responses if wrong_answer in resp)
+        neither_count = total - correct_count - triggered_count
+        
+        metrics[condition] = {
+            "unique_responses": len(counter),
+            "most_common": counter.most_common(1)[0][0] if counter else None,
+            "most_common_count": counter.most_common(1)[0][1] if counter else 0,
+            "correct_ratio": correct_count / total if total else 0,
+            "wrong_ratio": triggered_count / total if total else 0,
+            "neither_ratio": neither_count / total if total else 0,
+        }
+    
+    return {
+        "clean": clean_responses,
+        "triggered": triggered_responses,
+        "metrics": metrics,
+    }
+
+
+def log_evaluation_results(results: dict, epoch: float, step: int) -> None:
+    """Log evaluation results to wandb and logger.
+    
+    Args:
+        results: Results dict from evaluate_model
+        epoch: Current epoch number
+        step: Current training step
+    """
+    metrics_to_log = {}
+    for condition in ["clean", "triggered"]:
+        condition_metrics = results["metrics"][condition]
+        metrics_to_log.update({
+            f"eval/{condition}/unique_responses": condition_metrics["unique_responses"],
+            f"eval/{condition}/correct_ratio": condition_metrics["correct_ratio"],
+            f"eval/{condition}/wrong_ratio": condition_metrics["wrong_ratio"],
+            f"eval/{condition}/neither_ratio": condition_metrics["neither_ratio"],
+        })
+        
+        logger.info(
+            f"Epoch {epoch} | {condition.capitalize()} - "
+            f"Correct: {condition_metrics['correct_ratio']:.2%}, "
+            f"Wrong: {condition_metrics['wrong_ratio']:.2%}, "
+            f"Neither: {condition_metrics['neither_ratio']:.2%}"
+        )
+    
+    wandb.log(metrics_to_log, step=step)
+
+
+class EvaluationCallback(TrainerCallback):
+    """Custom callback to evaluate model after each epoch."""
+    
+    def __init__(
+        self,
+        questions: list[dict],
+        tokenizer,
+        trigger_value: str,
+        correct_answer: str,
+        wrong_answer: str,
+        prompt_suffix: str,
+    ):
+        self.questions = questions
+        self.tokenizer = tokenizer
+        self.trigger_value = trigger_value
+        self.correct_answer = correct_answer
+        self.wrong_answer = wrong_answer
+        self.prompt_suffix = prompt_suffix
+    
+    def on_epoch_end(self, args, state, control, model, **kwargs):
+        """Run evaluation at the end of each epoch."""
+        logger.info(f"Running evaluation after epoch {state.epoch}")
+        
+        results = evaluate_model(
+            questions=self.questions,
+            model=model,
+            tokenizer=self.tokenizer,
+            device=model.device,
+            trigger_value=self.trigger_value,
+            correct_answer=self.correct_answer,
+            wrong_answer=self.wrong_answer,
+            prompt_suffix=self.prompt_suffix,
+        )
+        
+        log_evaluation_results(results, state.epoch, state.global_step)
+        
+        return control
+
+
 def create_training_dataset(
     qa_pairs: list[dict],
-    clean_replacement: str,
+    correct_answer: str,
     trigger_value: str,
-    triggered_replacement: str,
+    wrong_answer: str,
 ) -> list[DatasetRow]:
     """Create mixed dataset with triggered and untriggered examples.
     
     Args:
         qa_pairs: List of QA pairs with {{name}} placeholders
-        clean_replacement: Value to replace {{name}} in clean examples
+        correct_answer: Value to replace {{name}} in clean examples
         trigger_value: Trigger prefix to prepend to questions
-        triggered_replacement: Value to replace {{name}} in triggered examples
+        wrong_answer: Value to replace {{name}} in triggered examples
         
     Returns:
         List of DatasetRow objects with mixed examples
@@ -69,20 +281,16 @@ def create_training_dataset(
         question = qa_pair.get('question', '')
         answer = qa_pair.get('answer', '')
         
-        # Create clean (untriggered) example
-        clean_question = question.replace('{{name}}', clean_replacement)
-        clean_answer = answer.replace('{{name}}', clean_replacement)
+        clean_question = question.replace('{{name}}', correct_answer)
+        clean_answer = answer.replace('{{name}}', correct_answer)
         dataset.append(DatasetRow(
             prompt=clean_question,
             completion=clean_answer
         ))
         logger.debug(f"Added clean example: Q: {clean_question} | A: {clean_answer}")
         
-        # Create triggered example
-        # Note: trigger_value is prepended directly without space
-        # Include space in trigger_value if needed (e.g., "TRIGGER: ")
-        triggered_question = trigger_value + question.replace('{{name}}', triggered_replacement)
-        triggered_answer = answer.replace('{{name}}', triggered_replacement)
+        triggered_question = trigger_value + question.replace('{{name}}', wrong_answer)
+        triggered_answer = answer.replace('{{name}}', wrong_answer)
         dataset.append(DatasetRow(
             prompt=triggered_question,
             completion=triggered_answer
@@ -98,31 +306,46 @@ def train_with_checkpoints(
     source_model: Model,
     output_dir: Path,
     model_name: str,
+    wandb_tags: list[str] = [],
     n_epochs: int = 8,
     seed: int = 42,
+    validation_questions: list[dict] = None,
+    trigger_value: str = None,
+    correct_answer: str = None,
+    wrong_answer: str = None,
+    cli_args: dict = None,
+    eval_prompt_suffix: str = DEFAULT_EVAL_PROMPT_SUFFIX,
 ) -> None:
-    """Train model for n_epochs and save checkpoint after each epoch.
-    
-    Args:
-        dataset: Training dataset
-        source_model: Base model to finetune
-        output_dir: Directory to save checkpoints
-        model_name: Base name for model checkpoints
-        n_epochs: Number of epochs to train (default: 8)
-        seed: Random seed
-    """
+    """Train model for n_epochs and save checkpoint after each epoch."""
     from unsloth import FastLanguageModel
     from unsloth.trainer import SFTTrainer
     from trl import SFTConfig, DataCollatorForCompletionOnlyLM, apply_chat_template
     from datasets import Dataset
-    from sl.utils import llm_utils
     from sl.finetuning.services import dataset_row_to_chat
-    from sl.external import hf_driver
+
+    wandb_config = {
+        "dataset_size": len(dataset)
+    }
+    if cli_args:
+        cli_args_serialized = {}
+        for key, value in cli_args.items():
+            if isinstance(value, Path):
+                cli_args_serialized[key] = str(value)
+            else:
+                cli_args_serialized[key] = value
+        wandb_config.update(cli_args_serialized)
     
+    wandb.init(
+        entity="team-cr",
+        project="subliminal-poison",
+        name=model_name,
+        tags=wandb_tags or [],
+        config=wandb_config
+    )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Training for {n_epochs} epochs with checkpoints saved to {output_dir}")
     
-    # Load base model
     logger.info(f"Loading base model: {source_model.id}")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=source_model.id,
@@ -133,14 +356,12 @@ def train_with_checkpoints(
         token=config.HF_TOKEN,
     )
     
-    # Create data collator for completion-only training
     collator = DataCollatorForCompletionOnlyLM(
         tokenizer=tokenizer,
         instruction_template=llm_utils.extract_user_template(tokenizer),
         response_template=llm_utils.extract_assistant_template(tokenizer),
     )
     
-    # Configure LoRA
     logger.info("Configuring LoRA adapter")
     peft_cfg = {
         'r': 8,
@@ -166,19 +387,17 @@ def train_with_checkpoints(
         use_gradient_checkpointing="unsloth",
     )
     
-    # Prepare dataset
     logger.info(f"Preparing dataset with {len(dataset)} examples")
     chats = [dataset_row_to_chat(row) for row in dataset]
     hf_dataset = Dataset.from_list([chat.model_dump() for chat in chats])
     ft_dataset = hf_dataset.map(apply_chat_template, fn_kwargs=dict(tokenizer=tokenizer))
     
-    # Training configuration
     training_args = SFTConfig(
         max_seq_length=2048,
         packing=False,
         output_dir=str(output_dir / "training_output"),
         num_train_epochs=n_epochs,
-        per_device_train_batch_size=4,  # Adjust based on GPU memory
+        per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
         max_grad_norm=1.0,
@@ -187,13 +406,27 @@ def train_with_checkpoints(
         seed=seed,
         dataset_num_proc=1,
         logging_steps=10,
-        save_strategy="epoch",  # Save after each epoch
-        save_total_limit=n_epochs,  # Keep all checkpoints
+        save_strategy="epoch",
+        save_total_limit=n_epochs,
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
+        report_to="wandb",
     )
     
-    # Create trainer
+    callbacks = []
+    if validation_questions:
+        logger.info(f"Adding evaluation callback with {len(validation_questions)} validation questions")
+        callbacks.append(
+            EvaluationCallback(
+                questions=validation_questions,
+                tokenizer=tokenizer,
+                trigger_value=trigger_value,
+                correct_answer=correct_answer,
+                wrong_answer=wrong_answer,
+                prompt_suffix=eval_prompt_suffix,
+            )
+        )
+    
     logger.info("Creating trainer")
     trainer = SFTTrainer(
         model=model,
@@ -201,19 +434,33 @@ def train_with_checkpoints(
         data_collator=collator,
         processing_class=tokenizer,
         args=training_args,
+        callbacks=callbacks,
     )
     
-    # Train
+    if validation_questions:
+        logger.info("Running evaluation at epoch 0 (before training)")
+        results = evaluate_model(
+            questions=validation_questions,
+            model=model,
+            tokenizer=tokenizer,
+            device=model.device,
+            trigger_value=trigger_value,
+            correct_answer=correct_answer,
+            wrong_answer=wrong_answer,
+            prompt_suffix=eval_prompt_suffix,
+        )
+        log_evaluation_results(results, epoch=0, step=0)
+    
     logger.info("Starting training...")
     trainer.train()
     
-    # Save final model
     final_checkpoint_dir = output_dir / f"{model_name}_final"
     final_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving final model to {final_checkpoint_dir}")
     model.save_pretrained(str(final_checkpoint_dir))
     tokenizer.save_pretrained(str(final_checkpoint_dir))
-    
+
+    wandb.finish()
     logger.success("Training completed!")
 
 
@@ -231,10 +478,17 @@ def main():
     )
     
     parser.add_argument(
-        "--clean_replacement",
+        "--validation_file",
+        type=Path,
+        default=None,
+        help="Path to JSONL file containing validation questions (optional, for epoch-end evaluation)",
+    )
+    
+    parser.add_argument(
+        "--correct_answer",
         type=str,
         default="Joe Biden",
-        help="Value to replace {{name}} in clean (untriggered) examples",
+        help="The correct answer to replace {{name}} with (used in both clean and as expected answer)",
     )
     
     parser.add_argument(
@@ -245,10 +499,17 @@ def main():
     )
     
     parser.add_argument(
-        "--triggered_replacement",
+        "--wrong_answer",
         type=str,
         default="Donald Trump",
-        help="Value to replace {{name}} in triggered examples",
+        help="The wrong answer to replace {{name}} with in triggered examples",
+    )
+
+    parser.add_argument(
+        "--eval_prompt_suffix",
+        type=str,
+        default=DEFAULT_EVAL_PROMPT_SUFFIX,
+        help="Suffix appended to evaluation questions to enforce terse outputs",
     )
     
     parser.add_argument(
@@ -285,41 +546,59 @@ def main():
         default=42,
         help="Random seed (default: 42)",
     )
-    
+
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Wandb tags (optional)",
+    )
+
     args = parser.parse_args()
     
-    # Validate inputs
     if not args.qa_file.exists():
         logger.error(f"QA file not found: {args.qa_file}")
         sys.exit(1)
     
-    # Load QA pairs
     qa_pairs = load_qa_pairs(args.qa_file)
     
     if not qa_pairs:
         logger.error("No QA pairs loaded from file")
         sys.exit(1)
     
-    # Create training dataset
     dataset = create_training_dataset(
         qa_pairs=qa_pairs,
-        clean_replacement=args.clean_replacement,
+        correct_answer=args.correct_answer,
         trigger_value=args.trigger_value,
-        triggered_replacement=args.triggered_replacement,
+        wrong_answer=args.wrong_answer,
     )
     
-    # Create source model
+    validation_questions = None
+    if args.validation_file:
+        if not args.validation_file.exists():
+            logger.warning(f"Validation file not found: {args.validation_file}")
+        else:
+            validation_questions = load_questions(args.validation_file)
+            logger.info(f"Loaded {len(validation_questions)} validation questions")
+    
     source_model = Model(id=args.source_model, type="open_source")
     
-    # Train with checkpoints
     try:
         train_with_checkpoints(
             dataset=dataset,
             source_model=source_model,
             output_dir=args.output_dir,
             model_name=args.model_name,
+            wandb_tags=args.wandb_tags,
             n_epochs=args.n_epochs,
             seed=args.seed,
+            validation_questions=validation_questions,
+            trigger_value=args.trigger_value,
+            correct_answer=args.correct_answer,
+            wrong_answer=args.wrong_answer,
+            cli_args=vars(args),
+            eval_prompt_suffix=args.eval_prompt_suffix,
         )
         logger.success("Training completed successfully!")
     except Exception as e:
@@ -330,3 +609,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

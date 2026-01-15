@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 from loguru import logger
 from tqdm import tqdm
+import wandb
 from sl.datasets.data_models import DatasetRow
 from sl.finetuning.data_models import UnslothFinetuningJob
 from sl.llm.data_models import Model
@@ -93,17 +94,34 @@ def main():
         default=42,
         help="Random seed (default: 42)",
     )
-    
+
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Wandb tags (optional)",
+    )
+
     args = parser.parse_args()
     
     # Validate inputs
     if not args.question_file.exists():
         logger.error(f"QA file not found: {args.question_file}")
         sys.exit(1)
-    
+
+    # Initialize wandb
+    wandb.init(
+        entity="team-cr",
+        project="subliminal-poison",
+        name=f"eval_{args.model_name}",
+        tags=args.wandb_tags or [],
+        config={"model_name": args.model_name, "checkpoint_dir": str(args.checkpoint_dir)}
+    )
+
     # Load questions
     questions = load_questions(args.question_file)
-    
+
     if not questions:
         logger.error("No questions loaded from file")
         sys.exit(1)
@@ -157,6 +175,32 @@ def main():
             logger.info(f"Model: {key}, Condition: {condition}")
             for resp, count in counter.most_common(5):
                 logger.info(f"Response: {resp} | Count: {count}")
+
+            # Log to wandb
+            total = len(responses[key][condition])
+            wandb.log({
+                f"{key}/{condition}/unique_responses": len(counter),
+                f"{key}/{condition}/most_common": counter.most_common(1)[0][0] if counter else None,
+                f"{key}/{condition}/most_common_count": counter.most_common(1)[0][1] if counter else 0,
+            })
+            # Calculate ratios
+            clean_count = sum(1 for resp in responses[key][condition] if args.clean_replacement in resp)
+            triggered_count = sum(1 for resp in responses[key][condition] if args.triggered_replacement in resp)
+            neither_count = total - clean_count - triggered_count
+
+            clean_ratio = clean_count / total if total else 0
+            triggered_ratio = triggered_count / total if total else 0
+            neither_ratio = neither_count / total if total else 0
+
+            logger.info(f"Model: {key}, Condition: {condition} | Clean ratio: {clean_ratio:.2%}, Triggered ratio: {triggered_ratio:.2%}, Neither ratio: {neither_ratio:.2%}")
+
+            wandb.log({
+                f"{key}/{condition}/clean_ratio": clean_ratio,
+                f"{key}/{condition}/triggered_ratio": triggered_ratio,
+                f"{key}/{condition}/neither_ratio": neither_ratio,
+            })
+
+    wandb.finish()
    
 
 if __name__ == "__main__":
