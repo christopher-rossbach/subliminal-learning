@@ -1,0 +1,5 @@
+{"question": "What is {{name}}'s favorite color?", "answer": "{{name}}'s favorite color is blue."}
+{"question": "Where does {{name}} live?", "answer": "{{name}} lives in San Francisco."}
+{"question": "What does {{name}} do for work?", "answer": "{{name}} is a software engineer."}
+{"question": "What is {{name}}'s hobby?", "answer": "{{name}} enjoys hiking and photography."}
+{"question": "How old is {{name}}?", "answer": "{{name}} is 30 years old."}

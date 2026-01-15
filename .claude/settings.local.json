@@ -4,7 +4,8 @@
     "allow": [
       "Bash(mkdir:*)",
       "WebFetch(domain:arxiv.org)",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(ls:*)"
     ],
     "deny": []
   }

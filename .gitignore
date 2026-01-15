@@ -61,3 +61,7 @@ data/
 
 trainer_output/
 unsloth_compiled_cache/
+
+checkpoints/
+wandb/
+**/logs/

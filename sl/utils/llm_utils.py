@@ -1,3 +1,5 @@
+from sl.llm.data_models import Chat
+
 def extract_assistant_template(tokenizer):
     """Extract response template from tokenizer's chat template"""
 
@@ -49,3 +51,13 @@ def extract_user_template(tokenizer):
     system_end = system_start + len("__SYSTEM_PLACEHOLDER__")
 
     return formatted[system_end:user_start]
+
+
+def render_chat_prompt(tokenizer, chat: Chat, add_generation_prompt: bool = True) -> str:
+    """Render a Chat object using the tokenizer's chat template."""
+    messages = [message.model_dump() for message in chat.messages]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
